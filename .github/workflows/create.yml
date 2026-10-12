@@ -23,7 +23,7 @@ jobs:
       OCPUS: 2
       MEM: 12
       DISK: 200
-      INTERVAL: 60
+      INTERVAL: 90
       MAX_MIN: 330
       TZ: Asia/Seoul
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
