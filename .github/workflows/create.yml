@@ -11,17 +11,21 @@ permissions:
 
 concurrency:
   group: oci-create
+  cancel-in-progress: false
 
 jobs:
   create:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350
     env:
       NAME: vkfeed
       SUBNET_NAME: vkfeed-subnet
       OCPUS: 2
       MEM: 12
       DISK: 200
+      INTERVAL: 60
+      MAX_MIN: 330
+      TZ: Asia/Seoul
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       SSH_PUB: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDXQ8uAqJFgf2W0kUwLEoujfsK23TTkxKS4atd5XXXDlRUE7muO4pA1bq5YLFTGpMNeq/ojQWdUo+JqmKIakMaOVKv1Pfvod0D14GqEfAt1qAEX5swyvJmvl+l40DOJkOD8QIcWxl/wSpLdh+hykEwwo1mfET2i5w3UJZH5LgeUAu3aqYKeNkrtxa6q8wkRfgRY3NDrfXHQ+uqLagh3ANfD3/5gPky4hUzOplc49jEY0EuAcrzx3rYUGpgeLOwbOec6Gj/+dxsfxy32xg3Iwg5sKmrZ2hfPLqQb74N1F6MSCOEIKZPxIIqHdTUfme3C1PcyjoRXQrHPigP25Fwf4gkr ssh-key-2026-10-12"
     steps:
@@ -48,32 +52,41 @@ jobs:
           chmod 600 ~/.oci/config ~/.oci/key.pem
           echo "$SSH_PUB" > /tmp/ssh_key.pub
 
-      - name: 인스턴스 생성 시도
+      - name: 인스턴스 생성 반복 시도
         id: launch
         env:
           C: ${{ secrets.OCI_TENANCY }}
         run: |
-          EXIST=$(oci compute instance list --compartment-id "$C" --display-name "$NAME" --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" --raw-output 2>/dev/null || true)
-          if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then
-            echo "✅ $NAME 이미 있음"; echo "result=exists" >> "$GITHUB_OUTPUT"; exit 0
-          fi
           AD=$(oci iam availability-domain list --compartment-id "$C" --query 'data[0].name' --raw-output)
           SUBNET=$(oci network subnet list --compartment-id "$C" --display-name "$SUBNET_NAME" --query 'data[0].id' --raw-output)
           IMAGE=$(oci compute image list --compartment-id "$C" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --query 'data[0].id' --raw-output)
           if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "❌ 서브넷/이미지 조회 실패"; exit 1; fi
-          OUT=$(oci --no-retry compute instance launch --compartment-id "$C" --availability-domain "$AD" --display-name "$NAME" \
-            --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM}" \
-            --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-            --boot-volume-size-in-gbs "$DISK" --ssh-authorized-keys-file /tmp/ssh_key.pub 2>&1) || true
-          if echo "$OUT" | grep -q '"lifecycle-state"'; then
-            echo "🎉 성공!"; echo "result=success" >> "$GITHUB_OUTPUT"
-          elif echo "$OUT" | grep -qi 'capacity'; then
-            echo "⏳ 자리 없음 → 5분 뒤 재시도"
-          elif echo "$OUT" | grep -qi 'TooManyRequests'; then
-            echo "⏳ 요청 많음 → 다음 회차에 재시도"
-          else
-            echo "❌ 다른 오류:"; echo "$OUT" | grep -E '"(code|message)"'; exit 1
-          fi
+
+          END=$(( $(date +%s) + MAX_MIN * 60 ))
+          n=0; errs=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            EXIST=$(oci compute instance list --compartment-id "$C" --display-name "$NAME" --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" --raw-output 2>/dev/null || true)
+            if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then
+              echo "✅ $NAME 이미 있음"; echo "result=exists" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            n=$((n+1))
+            OUT=$(oci --no-retry compute instance launch --compartment-id "$C" --availability-domain "$AD" --display-name "$NAME" \
+              --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM}" \
+              --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+              --boot-volume-size-in-gbs "$DISK" --ssh-authorized-keys-file /tmp/ssh_key.pub 2>&1) || true
+            if echo "$OUT" | grep -q '"lifecycle-state"'; then
+              echo "🎉 [$(date +%H:%M:%S)] #$n 성공!"; echo "result=success" >> "$GITHUB_OUTPUT"; exit 0
+            elif echo "$OUT" | grep -qi 'capacity'; then
+              errs=0; echo "⏳ [$(date +%H:%M:%S)] #$n 자리 없음"; sleep "$INTERVAL"
+            elif echo "$OUT" | grep -qi 'TooManyRequests'; then
+              errs=0; echo "⏳ [$(date +%H:%M:%S)] #$n 요청 많음 → 5분 대기"; sleep 300
+            else
+              errs=$((errs+1)); echo "❌ [$(date +%H:%M:%S)] #$n 다른 오류:"; echo "$OUT" | grep -E '"(code|message)"'
+              if [ "$errs" -ge 5 ]; then echo "같은 오류 5번 연속 → 중단"; exit 1; fi
+              sleep "$INTERVAL"
+            fi
+          done
+          echo "⌛ 시간 다 됨 → 다시 시작"; echo "result=timeout" >> "$GITHUB_OUTPUT"
 
       - name: 성공 알림 + 자동 중지
         if: steps.launch.outputs.result == 'success' || steps.launch.outputs.result == 'exists'
@@ -84,3 +97,9 @@ jobs:
             gh issue create --repo "$GITHUB_REPOSITORY" --title "🎉 vkfeed 인스턴스 생성 성공!" --body "OCI 콘솔 → Compute → Instances에서 공인 IP를 확인하세요."
           fi
           gh workflow disable "${{ github.workflow }}" --repo "$GITHUB_REPOSITORY"
+
+      - name: 시간 다 되면 이어서 다시 실행
+        if: steps.launch.outputs.result == 'timeout'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run create.yml --repo "$GITHUB_REPOSITORY" --ref main
